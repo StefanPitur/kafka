@@ -32,23 +32,30 @@ import net.sourceforge.argparse4j.inf.ArgumentParserException;
 import net.sourceforge.argparse4j.inf.MutuallyExclusiveGroup;
 import net.sourceforge.argparse4j.inf.Namespace;
 
+import java.io.FileWriter;
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Optional;
-import java.util.Properties;
-import java.util.Scanner;
-import java.util.SplittableRandom;
+import java.time.Instant;
+import java.util.*;
 
 import static net.sourceforge.argparse4j.impl.Arguments.store;
 import static net.sourceforge.argparse4j.impl.Arguments.storeTrue;
 
 public class ProducerPerformance {
+
+    /*
+    CLASSPATH=tools/build/libs/kafka-tools-4.1.0-SNAPSHOT.jar ./bin/kafka-producer-perf-test.sh \
+      --throughput 1000 \
+      --record-size 1024 \
+      --num-records 1000000 \
+      --topic first-topic \
+      --producer.config config/producer.properties
+    */
 
     public static final String DEFAULT_TRANSACTION_ID_PREFIX = "performance-producer-";
     public static final long DEFAULT_TRANSACTION_DURATION_MS = 3000L;
@@ -76,7 +83,7 @@ public class ProducerPerformance {
             // not thread-safe, do not share with other threads
             SplittableRandom random = new SplittableRandom(0);
             ProducerRecord<byte[], byte[]> record;
-            stats = new Stats(config.numRecords, 5000);
+            stats = new Stats(config.numRecords, 5000, config.csvPath);
             long startMs = System.currentTimeMillis();
 
             ThroughputThrottler throttler = new ThroughputThrottler(config.throughput, startMs);
@@ -331,6 +338,14 @@ public class ProducerPerformance {
                        "--producer.config, or --transactional-id but --transaction-duration-ms is not specified, " +
                        "the default value will be 3000.");
 
+        parser.addArgument("--csv-path")
+                .action(store())
+                .required(false)
+                .type(String.class)
+                .metavar("CSV-PATH")
+                .dest("csvPath")
+                .help("Path where to store execution metrics.");
+
         return parser;
     }
 
@@ -351,8 +366,14 @@ public class ProducerPerformance {
         private long windowTotalLatency;
         private long windowBytes;
         private long windowStart;
+        private final List<Integer> windowLatencies;
+        private final Path csvPath;
 
         public Stats(long numRecords, int reportingInterval) {
+            this(numRecords, reportingInterval, null);
+        }
+
+        public Stats(long numRecords, int reportingInterval, Path csvPath) {
             this.start = System.currentTimeMillis();
             this.windowStart = System.currentTimeMillis();
             this.iteration = 0;
@@ -366,6 +387,17 @@ public class ProducerPerformance {
             this.windowBytes = 0;
             this.totalLatency = 0;
             this.reportingInterval = reportingInterval;
+            this.windowLatencies = new LinkedList<>();
+            this.csvPath = csvPath;
+
+            if (this.csvPath != null) {
+                try (FileWriter writer = new FileWriter(csvPath.toFile(), false)) {
+                    writer.write("hostname,timestamp_iso,timestamp_ms,records_sent,recs_per_sec,mb_per_sec,avg_latency,max_latency,p50,p95,p99,p999\n");
+                } catch (IOException e) {
+                    System.err.println("Failed to write CSV header to: " + csvPath);
+                    e.printStackTrace();
+                }
+            }
         }
 
         public void record(int latency, int bytes, long time) {
@@ -377,6 +409,7 @@ public class ProducerPerformance {
             this.windowBytes += bytes;
             this.windowTotalLatency += latency;
             this.windowMaxLatency = Math.max(windowMaxLatency, latency);
+            this.windowLatencies.add(latency);
             if (this.iteration % this.sampling == 0) {
                 this.latencies[index] = latency;
                 this.index++;
@@ -409,15 +442,40 @@ public class ProducerPerformance {
         }
 
         public void printWindow() {
-            long elapsed = System.currentTimeMillis() - windowStart;
+            long timeNow = System.currentTimeMillis();
+            String isoTimestamp = Instant.now().toString();
+
+            long elapsed = timeNow - windowStart;
             double recsPerSec = 1000.0 * windowCount / (double) elapsed;
             double mbPerSec = 1000.0 * this.windowBytes / (double) elapsed / (1024.0 * 1024.0);
-            System.out.printf("%d records sent, %.1f records/sec (%.2f MB/sec), %.1f ms avg latency, %.1f ms max latency.%n",
+            double avgLatency = windowTotalLatency / (double) windowCount;
+            int[] percs = percentiles(this.windowLatencies.stream().mapToInt(Integer::intValue).toArray(), index, 0.5, 0.95, 0.99, 0.999);
+            System.out.printf("%d records sent, %.1f records/sec (%.2f MB/sec), %.1f ms avg latency, %.1f ms max latency, %d ms 50th, %d ms 95th, %d ms 99th, %d ms 99.9th.%n",
                               windowCount,
                               recsPerSec,
                               mbPerSec,
-                              windowTotalLatency / (double) windowCount,
-                              (double) windowMaxLatency);
+                              avgLatency,
+                              (double) windowMaxLatency,
+                              percs[0], percs[1], percs[2], percs[3]);
+
+            if (this.csvPath != null) {
+                try (FileWriter writer = new FileWriter(this.csvPath.toFile(), true)) {
+                    writer.append(String.format("%s,%s,%d,%d,%.1f,%.2f,%.1f,%.1f,%d,%d,%d,%d\n",
+                            resolveHostId(), isoTimestamp, timeNow, windowCount, recsPerSec, mbPerSec, avgLatency, (double) windowMaxLatency,
+                            percs[0], percs[1], percs[2], percs[3]));
+                } catch (IOException e) {
+                    System.err.println("Failed to append to CSV: " + this.csvPath);
+                    e.printStackTrace();
+                }
+            }
+        }
+
+        private String resolveHostId() {
+            try {
+                return InetAddress.getLocalHost().getHostName();
+            } catch (UnknownHostException e) {
+                return "unknown";
+            }
         }
 
         public void newWindow() {
@@ -426,6 +484,7 @@ public class ProducerPerformance {
             this.windowMaxLatency = 0;
             this.windowTotalLatency = 0;
             this.windowBytes = 0;
+            this.windowLatencies.clear();
         }
 
         public void printTotal() {
@@ -493,6 +552,7 @@ public class ProducerPerformance {
         final Long transactionDurationMs;
         final boolean transactionsEnabled;
         final List<byte[]> payloadByteList;
+        final Path csvPath;
 
         public ConfigPostProcessor(ArgumentParser parser, String[] args) throws IOException, ArgumentParserException {
             Namespace namespace = parser.parseArgs(args);
@@ -502,6 +562,12 @@ public class ProducerPerformance {
             this.throughput = namespace.getDouble("throughput");
             this.payloadMonotonic = namespace.getBoolean("payloadMonotonic");
             this.shouldPrintMetrics = namespace.getBoolean("printMetrics");
+
+            String csvPathString = namespace.getString("csvPath");
+            if (csvPathString != null && csvPathString.trim().isEmpty()) {
+                throw new ArgumentParserException("--csv-path provided but empty", parser);
+            }
+            this.csvPath = csvPathString != null ? Paths.get(csvPathString) : null;
 
             List<String> producerConfigs = namespace.getList("producerConfig");
             String producerConfigFile = namespace.getString("producerConfigFile");
