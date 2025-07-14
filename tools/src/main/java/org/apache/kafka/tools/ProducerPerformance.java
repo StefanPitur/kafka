@@ -449,7 +449,7 @@ public class ProducerPerformance {
             double recsPerSec = 1000.0 * windowCount / (double) elapsed;
             double mbPerSec = 1000.0 * this.windowBytes / (double) elapsed / (1024.0 * 1024.0);
             double avgLatency = windowTotalLatency / (double) windowCount;
-            int[] percs = percentiles(this.windowLatencies.stream().mapToInt(Integer::intValue).toArray(), index, 0.5, 0.95, 0.99, 0.999);
+            int[] percs = percentiles(this.windowLatencies.stream().mapToInt(Integer::intValue).toArray(), this.windowLatencies.size(), 0.5, 0.95, 0.99, 0.999);
             System.out.printf("%d records sent, %.1f records/sec (%.2f MB/sec), %.1f ms avg latency, %.1f ms max latency, %d ms 50th, %d ms 95th, %d ms 99th, %d ms 99.9th.%n",
                               windowCount,
                               recsPerSec,
