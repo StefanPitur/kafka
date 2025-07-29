@@ -33,15 +33,13 @@ import org.apache.kafka.server.util.CommandLineUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.FileWriter;
 import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.text.SimpleDateFormat;
 import java.time.Duration;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Map;
-import java.util.Properties;
-import java.util.Random;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
 
 import joptsimple.OptionException;
@@ -73,9 +71,10 @@ public class ConsumerPerformance {
             long currentTimeMs = System.currentTimeMillis();
             long joinStartMs = currentTimeMs;
             long startMs = currentTimeMs;
+            List<Long> e2eLatencyMs = new LinkedList<>();
             consume(consumer, options, totalMessagesRead, totalBytesRead, joinTimeMs,
                 bytesRead, messagesRead, lastBytesRead, lastMessagesRead,
-                joinStartMs, joinTimeMsInSingleRound);
+                joinStartMs, joinTimeMsInSingleRound, e2eLatencyMs);
             long endMs = System.currentTimeMillis();
 
             Map<MetricName, ? extends Metric> metrics = null;
@@ -104,6 +103,18 @@ public class ConsumerPerformance {
 
             if (metrics != null)
                 ToolsUtils.printMetrics(metrics);
+
+            String e2eCsvString = options.e2eCsvPath();
+            if (e2eCsvString != null) {
+                Path e2eCsvPath = Paths.get(e2eCsvString);
+                try (FileWriter writer = new FileWriter(e2eCsvPath.toFile(), false)) {
+                    for (long e2eLatency : e2eLatencyMs)
+                        writer.write(e2eLatency + "\n");
+                } catch (IOException e) {
+                    System.err.println("Failed to write latencies CSV.");
+                    e.printStackTrace();
+                }
+            }
         } catch (Throwable e) {
             System.err.println(e.getMessage());
             System.err.println(Utils.stackTrace(e));
@@ -130,6 +141,33 @@ public class ConsumerPerformance {
                                 long lastMessagesRead,
                                 long joinStartMs,
                                 AtomicLong joinTimeMsInSingleRound) {
+        consume(
+            consumer,
+            options,
+            totalMessagesRead,
+            totalBytesRead,
+            joinTimeMs,
+            bytesRead,
+            messagesRead,
+            lastBytesRead,
+            lastMessagesRead,
+            joinStartMs,
+            joinTimeMsInSingleRound,
+            null);
+    }
+
+    private static void consume(KafkaConsumer<byte[], byte[]> consumer,
+                                ConsumerPerfOptions options,
+                                AtomicLong totalMessagesRead,
+                                AtomicLong totalBytesRead,
+                                AtomicLong joinTimeMs,
+                                long bytesRead,
+                                long messagesRead,
+                                long lastBytesRead,
+                                long lastMessagesRead,
+                                long joinStartMs,
+                                AtomicLong joinTimeMsInSingleRound,
+                                List<Long> e2eLatencyMs) {
         long numMessages = options.numMessages();
         long recordFetchTimeoutMs = options.recordFetchTimeoutMs();
         long reportingIntervalMs = options.reportingIntervalMs();
@@ -149,6 +187,9 @@ public class ConsumerPerformance {
             if (!records.isEmpty())
                 lastConsumedTimeMs = currentTimeMs;
             for (ConsumerRecord<byte[], byte[]> record : records) {
+                long e2eTimeMs = currentTimeMs - record.timestamp();
+                e2eLatencyMs.add(e2eTimeMs);
+
                 messagesRead += 1;
                 if (record.key() != null)
                     bytesRead += record.key().length;
@@ -259,6 +300,7 @@ public class ConsumerPerformance {
         private final OptionSpec<Long> reportingIntervalOpt;
         private final OptionSpec<String> dateFormatOpt;
         private final OptionSpec<Void> hideHeaderOpt;
+        private final OptionSpec<String> e2eLatencyCsvPathOpt;
 
         public ConsumerPerfOptions(String[] args) {
             super(args);
@@ -316,6 +358,10 @@ public class ConsumerPerformance {
                 .ofType(String.class)
                 .defaultsTo("yyyy-MM-dd HH:mm:ss:SSS");
             hideHeaderOpt = parser.accepts("hide-header", "If set, skips printing the header for the stats");
+            e2eLatencyCsvPathOpt = parser.accepts("e2e-csv-path", "If set, output for each record id the e2e latency")
+                    .withOptionalArg()
+                    .describedAs("e2e Latency Csv Path")
+                    .ofType(String.class);
             try {
                 options = parser.parse(args);
             } catch (OptionException e) {
@@ -383,6 +429,10 @@ public class ConsumerPerformance {
 
         public long recordFetchTimeoutMs() {
             return options.valueOf(recordFetchTimeoutOpt);
+        }
+
+        public String e2eCsvPath() {
+            return options.valueOf(e2eLatencyCsvPathOpt);
         }
     }
 }
