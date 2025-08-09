@@ -24,6 +24,7 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.Metric;
 import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.utils.Exit;
 import org.apache.kafka.common.utils.Utils;
@@ -71,10 +72,25 @@ public class ConsumerPerformance {
             long currentTimeMs = System.currentTimeMillis();
             long joinStartMs = currentTimeMs;
             long startMs = currentTimeMs;
-            List<Long> e2eLatencyMs = new LinkedList<>();
-            consume(consumer, options, totalMessagesRead, totalBytesRead, joinTimeMs,
-                bytesRead, messagesRead, lastBytesRead, lastMessagesRead,
-                joinStartMs, joinTimeMsInSingleRound, e2eLatencyMs);
+
+            String e2eCsvString = options.e2eCsvPath();
+            if (e2eCsvString != null) {
+                Path e2eCsvPath = Paths.get(e2eCsvString);
+                try (FileWriter writer = new FileWriter(e2eCsvPath.toFile(), false)) {
+                    writer.write("latency_ms\n");
+                    consume(consumer, options, totalMessagesRead, totalBytesRead, joinTimeMs,
+                            bytesRead, messagesRead, lastBytesRead, lastMessagesRead,
+                            joinStartMs, joinTimeMsInSingleRound, writer);
+                } catch (IOException e) {
+                    System.err.println("Failed to write latencies CSV.");
+                    e.printStackTrace();
+                    throw e;
+                }
+            } else {
+                consume(consumer, options, totalMessagesRead, totalBytesRead, joinTimeMs,
+                        bytesRead, messagesRead, lastBytesRead, lastMessagesRead,
+                        joinStartMs, joinTimeMsInSingleRound);
+            }
             long endMs = System.currentTimeMillis();
 
             Map<MetricName, ? extends Metric> metrics = null;
@@ -103,18 +119,6 @@ public class ConsumerPerformance {
 
             if (metrics != null)
                 ToolsUtils.printMetrics(metrics);
-
-            String e2eCsvString = options.e2eCsvPath();
-            if (e2eCsvString != null) {
-                Path e2eCsvPath = Paths.get(e2eCsvString);
-                try (FileWriter writer = new FileWriter(e2eCsvPath.toFile(), false)) {
-                    for (long e2eLatency : e2eLatencyMs)
-                        writer.write(e2eLatency + "\n");
-                } catch (IOException e) {
-                    System.err.println("Failed to write latencies CSV.");
-                    e.printStackTrace();
-                }
-            }
         } catch (Throwable e) {
             System.err.println(e.getMessage());
             System.err.println(Utils.stackTrace(e));
@@ -167,7 +171,7 @@ public class ConsumerPerformance {
                                 long lastMessagesRead,
                                 long joinStartMs,
                                 AtomicLong joinTimeMsInSingleRound,
-                                List<Long> e2eLatencyMs) {
+                                FileWriter e2eCsvFileWriter) {
         long numMessages = options.numMessages();
         long recordFetchTimeoutMs = options.recordFetchTimeoutMs();
         long reportingIntervalMs = options.reportingIntervalMs();
@@ -186,9 +190,11 @@ public class ConsumerPerformance {
             currentTimeMs = System.currentTimeMillis();
             if (!records.isEmpty())
                 lastConsumedTimeMs = currentTimeMs;
+
+            List<Long> e2eLatencies = new ArrayList<>(records.count());
             for (ConsumerRecord<byte[], byte[]> record : records) {
                 long e2eTimeMs = currentTimeMs - record.timestamp();
-                e2eLatencyMs.add(e2eTimeMs);
+                e2eLatencies.add(e2eTimeMs);
 
                 messagesRead += 1;
                 if (record.key() != null)
@@ -203,6 +209,16 @@ public class ConsumerPerformance {
                     lastReportTimeMs = currentTimeMs;
                     lastMessagesRead = messagesRead;
                     lastBytesRead = bytesRead;
+                }
+            }
+
+            if (e2eCsvFileWriter != null) {
+                try {
+                    for (long e2eLatency : e2eLatencies)
+                        e2eCsvFileWriter.write(e2eLatency + "\n");
+                } catch (IOException e) {
+                    System.err.println("Failed to write latencies CSV.");
+                    e.printStackTrace();
                 }
             }
         }
